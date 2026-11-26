@@ -404,7 +404,15 @@
             this.confidenceThreshold = 0.6;
             this.maxBoxes = 5;
             this.targetLabel = 'Target';
-            this.tracks = []; // { box, conf, miss }
+            this.tracks = []; // { box, conf, hits, miss }
+            this.lastTime = 0;
+
+            // 表示の落ち着かせ方 (検出の判定そのものには影響しない)
+            this.smoothTime = 0.25;  // 秒。枠が新しい位置に追いつく速さ (大きいほどゆっくり)
+            this.confirmHits = 2;    // 何フレーム続けて見えたら表示するか (一瞬の誤検出を出さない)
+            this.holdMisses = 4;     // 何フレーム見失うまで表示を続けるか (点滅を防ぐ)
+            this.edgeLow = 0.3;      // 枠の端を半マス単位で調整するときの下限確率
+            this.deadZone = 0.02;    // 画面の2%未満のずれは無視して枠を止めておく (小刻みな震えを防ぐ)
         }
 
         setTargetLabel(label) { this.targetLabel = label; }
@@ -423,15 +431,21 @@
             const prob = await probT.data();
             probT.dispose();
 
-            this._updateTracks(this._findBlobs(prob));
+            const now = performance.now();
+            const dt = this.lastTime ? Math.min(0.5, (now - this.lastTime) / 1000) : 0;
+            this.lastTime = now;
+
+            this._updateTracks(this._findBlobs(prob), dt);
             return this.tracks
-                .filter(t => t.miss === 0)
+                .filter(t => t.hits >= this.confirmHits)
                 .map(t => ({ box: { ...t.box }, label: this.targetLabel, conf: t.conf }));
         }
 
         /** 前フレームの枠と重なるものは同じ物として滑らかに動かす */
-        _updateTracks(blobs) {
+        _updateTracks(blobs, dt) {
             const iou = AppUtils.CollisionDetector.calculateIoU;
+            // フレームの間隔に関係なく同じ速さで追いつく係数
+            const a = dt > 0 ? 1 - Math.exp(-dt / this.smoothTime) : 1;
             const used = new Set();
             for (const t of this.tracks) {
                 let best = -1, bestIoU = 0.2;
@@ -443,20 +457,38 @@
                 if (best >= 0) {
                     const b = blobs[best];
                     used.add(best);
-                    const a = 0.35;
-                    ['x', 'y', 'w', 'h'].forEach(k => { t.box[k] = t.box[k] * (1 - a) + b[k] * a; });
-                    t.conf = b.conf;
+                    ['x', 'y', 'w', 'h'].forEach(k => {
+                        const d = b[k] - t.box[k];
+                        if (Math.abs(d) >= this.deadZone) t.box[k] += d * a;
+                    });
+                    t.conf += (b.conf - t.conf) * a;
+                    t.hits++;
                     t.miss = 0;
                 } else {
                     t.miss++;
                 }
             }
-            this.tracks = this.tracks.filter(t => t.miss <= 3);
+            // 確定前に見失ったものはすぐ捨てる / 確定済みはしばらく表示を続ける
+            this.tracks = this.tracks.filter(t =>
+                t.hits >= this.confirmHits ? t.miss <= this.holdMisses : t.miss === 0);
             blobs.forEach((b, i) => {
                 if (!used.has(i) && this.tracks.length < this.maxBoxes) {
-                    this.tracks.push({ box: { x: b.x, y: b.y, w: b.w, h: b.h }, conf: b.conf, miss: 0 });
+                    this.tracks.push({ box: { x: b.x, y: b.y, w: b.w, h: b.h }, conf: b.conf, hits: 1, miss: 0 });
                 }
             });
+        }
+
+        /**
+         * 塊の端を半マス単位で調整する量 (マス単位)。
+         * 端のマスが「ぎりぎり対象」なら内側へ、外隣のマスが「対象に近い」なら外側へ。
+         * しきい値をまたいでマスが増減しても、枠の端が1マス分いきなり飛ばないようにする。
+         */
+        _edgeOffset(pIn, pOut) {
+            const th = this.confidenceThreshold, lo = this.edgeLow;
+            const clamp01 = (v) => Math.max(0, Math.min(1, v));
+            const shrink = 0.5 * (1 - clamp01((pIn - th) / (1 - th)));
+            const grow = 0.5 * clamp01((pOut - lo) / (th - lo));
+            return grow - shrink;
         }
 
         /** しきい値以上のマスの塊をすべて枠にする (ノイズ的な1マスは除外) */
@@ -464,27 +496,45 @@
             const th = this.confidenceThreshold;
             const seen = new Uint8Array(GRID * GRID);
             const blobs = [];
+            const P = (r, c) => (r < 0 || c < 0 || r >= GRID || c >= GRID) ? 0 : prob[r * GRID + c];
             for (let i = 0; i < GRID * GRID; i++) {
                 if (seen[i] || prob[i] < th) continue;
                 const stack = [i];
+                const members = [];
                 seen[i] = 1;
-                let minR = GRID, maxR = -1, minC = GRID, maxC = -1, score = 0, maxP = 0, cells = 0;
+                let minR = GRID, maxR = -1, minC = GRID, maxC = -1, score = 0, maxP = 0;
                 while (stack.length) {
                     const k = stack.pop();
+                    members.push(k);
                     const r = Math.floor(k / GRID), c = k % GRID;
                     minR = Math.min(minR, r); maxR = Math.max(maxR, r);
                     minC = Math.min(minC, c); maxC = Math.max(maxC, c);
-                    score += prob[k]; maxP = Math.max(maxP, prob[k]); cells++;
+                    score += prob[k]; maxP = Math.max(maxP, prob[k]);
                     [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]].forEach(([rr, cc]) => {
                         if (rr < 0 || cc < 0 || rr >= GRID || cc >= GRID) return;
                         const n = rr * GRID + cc;
                         if (!seen[n] && prob[n] >= th) { seen[n] = 1; stack.push(n); }
                     });
                 }
-                if (cells < 2 && maxP < 0.85) continue;
+                if (members.length < 2 && maxP < 0.85) continue;
+
+                // 4辺それぞれについて、端のマスとその外隣のマスの確率 (最大値) を調べる
+                const e = { L: [0, 0], R: [0, 0], T: [0, 0], B: [0, 0] };
+                for (const k of members) {
+                    const r = Math.floor(k / GRID), c = k % GRID, p = prob[k];
+                    if (c === minC) { e.L[0] = Math.max(e.L[0], p); e.L[1] = Math.max(e.L[1], P(r, c - 1)); }
+                    if (c === maxC) { e.R[0] = Math.max(e.R[0], p); e.R[1] = Math.max(e.R[1], P(r, c + 1)); }
+                    if (r === minR) { e.T[0] = Math.max(e.T[0], p); e.T[1] = Math.max(e.T[1], P(r - 1, c)); }
+                    if (r === maxR) { e.B[0] = Math.max(e.B[0], p); e.B[1] = Math.max(e.B[1], P(r + 1, c)); }
+                }
+                const left = Math.max(0, minC - this._edgeOffset(...e.L));
+                const right = Math.min(GRID, maxC + 1 + this._edgeOffset(...e.R));
+                const top = Math.max(0, minR - this._edgeOffset(...e.T));
+                const bottom = Math.min(GRID, maxR + 1 + this._edgeOffset(...e.B));
+
                 blobs.push({
-                    x: minC / GRID, y: minR / GRID,
-                    w: (maxC - minC + 1) / GRID, h: (maxR - minR + 1) / GRID,
+                    x: left / GRID, y: top / GRID,
+                    w: Math.max(0.5, right - left) / GRID, h: Math.max(0.5, bottom - top) / GRID,
                     conf: maxP, score
                 });
             }
@@ -493,7 +543,7 @@
 
         setMode(active) {
             this.isActive = active;
-            if (!active) this.tracks = [];
+            if (!active) { this.tracks = []; this.lastTime = 0; }
         }
     }
 

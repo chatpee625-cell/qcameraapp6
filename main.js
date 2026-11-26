@@ -16,8 +16,7 @@
             drawingBox: null,   // 指で描いている途中の枠
             startPos: null,
             datasetCount: 0,
-            pendingFrame: null,
-            lastDetectCount: 0
+            pendingFrame: null
         },
 
         dom: {},
@@ -96,9 +95,11 @@
 
         resizeCanvas() {
             if (this.dom.canvas && this.dom.viewport) {
+                // 高解像度画面では画素数を増やし、線をくっきり描く
                 const rect = this.dom.viewport.getBoundingClientRect();
-                this.dom.canvas.width = rect.width;
-                this.dom.canvas.height = rect.height;
+                const dpr = window.devicePixelRatio || 1;
+                this.dom.canvas.width = Math.round(rect.width * dpr);
+                this.dom.canvas.height = Math.round(rect.height * dpr);
             }
         },
 
@@ -182,7 +183,6 @@
                     this.updateStatus('OK', '検出中');
                 }
                 AppEngine.InferenceEngine.setMode(true);
-                this.state.lastDetectCount = 0;
                 this.runInferenceLoop();
             } else if (mode === 'TRAIN') {
                 this.updateStatus('WARN', '対象を指で囲む');
@@ -333,6 +333,7 @@
 
         async startTraining() {
             this.dom.trainPanel.style.display = 'grid';
+            this.dom.annoTools.style.display = 'none'; // 学習パネルと重ならないよう隠す
             this.sfx.playLearnStart();
             this.updateStatus('WARN', '学習中…');
             this.dom.btnAction.disabled = true;
@@ -347,6 +348,7 @@
             this.dom.btnAction.disabled = false;
             this.dom.btnDetect.disabled = false;
             this.dom.btnTrain.disabled = false;
+            this.dom.annoTools.style.display = 'flex';
             this.visual.resetOverfitVisual();
 
             if (result.success) {
@@ -399,14 +401,8 @@
             results.forEach(res => {
                 const screenBox = AppUtils.CoordinateTransformer.denormalize(res.box, layout);
                 this.visual.drawBBox(screenBox, res.label, res.conf);
-                // 新たに見つけた瞬間だけパーティクル演出
-                if (results.length > this.state.lastDetectCount) {
-                    this.visual.spawnDetectionParticles(screenBox.x, screenBox.y, screenBox.w, screenBox.h);
-                }
             });
-            this.state.lastDetectCount = results.length;
 
-            this.visual.updateParticles();
             requestAnimationFrame(() => this.runInferenceLoop());
         },
 
@@ -470,10 +466,11 @@
             const w = this.dom.canvas.width;
             const h = this.dom.canvas.height;
             const ctx = this.dom.canvas.getContext('2d');
+            const s = this.dom.canvas.clientWidth ? w / this.dom.canvas.clientWidth : 1;
             ctx.save();
-            ctx.strokeStyle = '#00ffcc';
-            ctx.lineWidth = 2;
-            ctx.fillStyle = 'rgba(0, 255, 204, 0.15)';
+            ctx.strokeStyle = DetectionUXHelper.Colors.PRIMARY;
+            ctx.lineWidth = 2 * s;
+            ctx.fillStyle = 'rgba(76, 155, 232, 0.12)';
             boxes.forEach(bbox => {
                 ctx.fillRect(bbox.x * w, bbox.y * h, bbox.w * w, bbox.h * h);
                 ctx.strokeRect(bbox.x * w, bbox.y * h, bbox.w * w, bbox.h * h);
