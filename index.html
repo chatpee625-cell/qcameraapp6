@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>YOLOv10n On-Device Trainer</title>
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Viewport: Camera & Canvas Layer -->
+        <div class="viewport-container" id="viewport-container">
+            <video id="camera-stream" autoplay playsinline muted></video>
+            <canvas id="detection-canvas"></canvas>
+
+            <div id="ui-overlay" class="overlay-ui">
+                <!-- Top Status Bar -->
+                <div class="top-status-bar">
+                    <div class="status-badge">
+                        <div id="status-dot" class="status-dot ok"></div>
+                        <span id="status-text">起動中…</span>
+                    </div>
+                    <div class="status-badge">
+                        <span id="memory-usage">RAM: --</span>
+                    </div>
+                </div>
+
+                <!-- Training Dashboard -->
+                <div id="training-dashboard" class="panel-glass training-panel" style="display: none;">
+                    <div class="progress-container">
+                        <div id="training-progress-bar" class="progress-bar"></div>
+                    </div>
+                    <div class="metric-grid">
+                        <div class="metric-item">
+                            <span class="metric-label">学習Loss</span>
+                            <span id="val-train-loss" class="metric-value">0.0000</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label">検証Loss</span>
+                            <span id="val-val-loss" class="metric-value">0.0000</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label">エポック</span>
+                            <span id="val-epoch" class="metric-value">0</span>
+                        </div>
+                    </div>
+                    <canvas id="loss-chart-canvas" width="300" height="60"></canvas>
+                </div>
+
+                <!-- Annotation Tools -->
+                <div id="annotation-tools" class="annotation-toolbar" style="display: none;">
+                    <button id="btn-tool-bbox" class="tool-btn active" title="背景だけ撮る (対象が写っていない場面)">背景</button>
+                    <button id="btn-tool-clear" class="tool-btn" title="撮影データを全部消す">🗑️</button>
+                    <button id="btn-tool-save" class="tool-btn" title="学習結果をファイルに保存">💾</button>
+                    <button id="btn-tool-load" class="tool-btn" title="保存した学習結果を読み込む">📂</button>
+                    <input id="file-load" type="file" accept=".json,application/json" style="display: none;">
+                </div>
+
+                <!-- Bottom Control Panel -->
+                <div class="bottom-panel panel-glass">
+                    <div class="control-buttons">
+                        <button id="btn-mode-detect" class="btn btn-secondary">検出</button>
+                        <button id="btn-mode-train" class="btn btn-secondary">学習</button>
+                        <button id="btn-action-main" class="btn btn-primary">撮影</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TensorFlow.js (v4で追加。オフライン化する場合は tf.min.js を同じフォルダに置き ./tf.min.js に変更) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+    <!-- Script Loading Order: 依存関係順に読み込み -->
+    <script src="./utils.js"></script>
+    <script src="./ux-helper.js"></script>
+    <script src="./engine.js"></script>
+    <script src="./main.js"></script>
+</body>
+</html>
