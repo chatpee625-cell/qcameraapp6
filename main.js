@@ -1,13 +1,14 @@
 /**
  * @file main.js
  * @description 全体オーケストレーション、イベント接続およびUI状態更新
- * v4: TensorFlow.js による実学習・実推論に対応
  *   - 画面に見えている範囲をそのまま 224x224 に切り出して学習/推論 (座標ズレ防止)
  *   - 枠を描き始めた瞬間に映像を一時停止し、そのフレームを学習データにする
- *   - 何枚でも撮影可能 (枠を描く→CAPTURE を繰り返す)
+ *   - 何枚でも撮影可能 (枠を描く→保存 を繰り返す)
  */
 
 (function() {
+    const SOUND_KEY = 'app_sound_enabled';
+
     const Orchestrator = {
         state: {
             mode: 'READY', // READY, DETECT, TRAIN
@@ -15,8 +16,7 @@
             currentBoxes: [],   // 確定した枠 (1枚の写真に複数OK)
             drawingBox: null,   // 指で描いている途中の枠
             startPos: null,
-            datasetCount: 0,
-            pendingFrame: null
+            pendingFrame: null  // 枠を描き始めたときに止めたフレーム
         },
 
         dom: {},
@@ -37,6 +37,7 @@
                 this.cacheDOM();
                 this.visual = DetectionUXHelper.Visual('detection-canvas');
                 this.sfx = DetectionUXHelper.Sfx;
+                this.loadSoundSetting();
 
                 const size = AppEngine.INPUT_SIZE;
                 this.inferCanvas = document.createElement('canvas');
@@ -68,28 +69,39 @@
         },
 
         cacheDOM() {
+            const $ = (id) => document.getElementById(id);
             this.dom = {
-                viewport: document.getElementById('viewport-container'),
-                video: document.getElementById('camera-stream'),
-                canvas: document.getElementById('detection-canvas'),
-                statusDot: document.getElementById('status-dot'),
-                statusText: document.getElementById('status-text'),
-                memUsage: document.getElementById('memory-usage'),
-                trainPanel: document.getElementById('training-dashboard'),
-                progressBar: document.getElementById('training-progress-bar'),
-                trainLoss: document.getElementById('val-train-loss'),
-                valLoss: document.getElementById('val-val-loss'),
-                epochVal: document.getElementById('val-epoch'),
-                lossChart: document.getElementById('loss-chart-canvas'),
-                btnDetect: document.getElementById('btn-mode-detect'),
-                btnTrain: document.getElementById('btn-mode-train'),
-                btnAction: document.getElementById('btn-action-main'),
-                annoTools: document.getElementById('annotation-tools'),
-                btnClear: document.getElementById('btn-tool-clear'),
-                btnBg: document.getElementById('btn-tool-bbox'),
-                btnSave: document.getElementById('btn-tool-save'),
-                btnLoad: document.getElementById('btn-tool-load'),
-                fileLoad: document.getElementById('file-load')
+                viewport: $('viewport-container'),
+                video: $('camera-stream'),
+                canvas: $('detection-canvas'),
+                flash: $('capture-flash'),
+                statusDot: $('status-dot'),
+                statusText: $('status-text'),
+                memUsage: $('memory-usage'),
+                btnMenu: $('btn-menu'),
+                menu: $('menu-panel'),
+                btnMenuSave: $('btn-menu-save'),
+                btnMenuLoad: $('btn-menu-load'),
+                btnMenuSound: $('btn-menu-sound'),
+                fileLoad: $('file-load'),
+                trainInfo: $('train-info'),
+                countObj: $('count-obj'),
+                countBg: $('count-bg'),
+                trainHint: $('train-hint'),
+                btnClear: $('btn-clear-data'),
+                trainPanel: $('training-dashboard'),
+                progressBar: $('training-progress-bar'),
+                trainLoss: $('val-train-loss'),
+                valLoss: $('val-val-loss'),
+                epochVal: $('val-epoch'),
+                lossChart: $('loss-chart-canvas'),
+                toast: $('toast'),
+                freezeChip: $('freeze-chip'),
+                btnDetect: $('btn-mode-detect'),
+                btnTrain: $('btn-mode-train'),
+                trainActions: $('train-actions'),
+                btnSub: $('btn-train-sub'),
+                btnMain: $('btn-train-main')
             };
         },
 
@@ -100,6 +112,7 @@
                 const dpr = window.devicePixelRatio || 1;
                 this.dom.canvas.width = Math.round(rect.width * dpr);
                 this.dom.canvas.height = Math.round(rect.height * dpr);
+                if (this.state.mode === 'TRAIN') this.renderCurrentBBox();
             }
         },
 
@@ -142,11 +155,17 @@
         setupEventListeners() {
             this.dom.btnDetect.onclick = () => this.setMode('DETECT');
             this.dom.btnTrain.onclick = () => this.setMode('TRAIN');
-            this.dom.btnAction.onclick = () => this.handleMainAction();
+            this.dom.btnSub.onclick = () => this.handleSubAction();
+            this.dom.btnMain.onclick = () => this.handleMainAction();
             this.dom.btnClear.onclick = () => this.clearDataset();
-            this.dom.btnBg.onclick = () => this.captureBackground();
-            this.dom.btnSave.onclick = () => this.exportModel();
-            this.dom.btnLoad.onclick = () => this.dom.fileLoad.click();
+
+            // メニュー
+            this.dom.btnMenu.onclick = (e) => { e.stopPropagation(); this.toggleMenu(); };
+            this.dom.menu.onclick = (e) => e.stopPropagation();
+            document.addEventListener('click', () => this.toggleMenu(false));
+            this.dom.btnMenuSave.onclick = () => { this.toggleMenu(false); this.exportModel(); };
+            this.dom.btnMenuLoad.onclick = () => { this.toggleMenu(false); this.dom.fileLoad.click(); };
+            this.dom.btnMenuSound.onclick = () => this.setSound(!this.sfx.enabled);
             this.dom.fileLoad.onchange = (e) => this.importModel(e.target.files[0]);
 
             const canvas = this.dom.canvas;
@@ -164,19 +183,49 @@
             canvas.addEventListener('touchend', () => this.endAnno());
         },
 
+        // ---------- メニュー・設定 ----------
+
+        toggleMenu(open) {
+            const show = open === undefined ? this.dom.menu.hidden : open;
+            this.dom.menu.hidden = !show;
+            this.dom.btnMenu.setAttribute('aria-expanded', String(show));
+        },
+
+        loadSoundSetting() {
+            let on = false; // 初期状態は音なし
+            try { on = localStorage.getItem(SOUND_KEY) === '1'; } catch (e) { /* noop */ }
+            this.setSound(on, false);
+        },
+
+        setSound(on, save = true) {
+            this.sfx.enabled = on;
+            this.dom.btnMenuSound.setAttribute('aria-pressed', String(on));
+            this.dom.btnMenuSound.querySelector('.toggle-state').textContent = on ? 'オン' : 'オフ';
+            if (save) {
+                try { localStorage.setItem(SOUND_KEY, on ? '1' : '0'); } catch (e) { /* noop */ }
+            }
+        },
+
+        // ---------- 画面の状態 ----------
+
         setMode(mode) {
             if (AppEngine.TrainingEngine.isTraining) return;
             this.state.mode = mode;
             this.dom.btnDetect.className = mode === 'DETECT' ? 'btn btn-primary' : 'btn btn-secondary';
             this.dom.btnTrain.className = mode === 'TRAIN' ? 'btn btn-primary' : 'btn btn-secondary';
-            this.dom.btnAction.onclick = () => this.handleMainAction();
             this.visual.resetOverfitVisual();
+            this.state.currentBoxes = [];
+            this.state.drawingBox = null;
+            this.state.pendingFrame = null;
             this.resumeVideo();
+            this.clearCanvas();
+
+            const isTrain = mode === 'TRAIN';
+            this.dom.trainInfo.hidden = !isTrain;
+            this.dom.trainActions.hidden = !isTrain;
+            this.dom.trainPanel.style.display = 'none';
 
             if (mode === 'DETECT') {
-                this.dom.trainPanel.style.display = 'none';
-                this.dom.annoTools.style.display = 'none';
-                this.dom.btnAction.innerText = 'ピン';
                 if (!AppEngine.InferenceEngine.isTrained()) {
                     this.updateStatus('WARN', '未学習（先に学習を）');
                 } else {
@@ -184,26 +233,65 @@
                 }
                 AppEngine.InferenceEngine.setMode(true);
                 this.runInferenceLoop();
-            } else if (mode === 'TRAIN') {
-                this.updateStatus('WARN', '対象を指で囲む');
-                this.dom.annoTools.style.display = 'flex';
+            } else if (isTrain) {
+                this.updateStatus('OK', '学習モード');
                 AppEngine.InferenceEngine.setMode(false);
-                this.state.currentBoxes = [];
-                this.state.pendingFrame = null;
-                this.clearCanvas();
-                this.updateActionLabel();
             }
+            this.updateTrainUI();
         },
 
-        updateActionLabel() {
+        /** 枠を描いている途中 (映像が止まっている) か */
+        isFrozen() {
+            return this.state.mode === 'TRAIN' && !!this.state.pendingFrame;
+        },
+
+        canTrain() {
+            const c = AppEngine.DataManager.counts();
+            return c.obj >= 1 && c.obj + c.bg >= 2;
+        },
+
+        /** 学習モードの表示 (枚数・案内・ボタン・停止中の表示) をまとめて更新 */
+        updateTrainUI() {
+            const frozen = this.isFrozen();
+            this.dom.viewport.classList.toggle('is-frozen', frozen);
+            this.dom.freezeChip.hidden = !frozen;
             if (this.state.mode !== 'TRAIN') return;
-            const n = this.state.datasetCount;
-            if (this.state.currentBoxes.length > 0) {
-                this.dom.btnAction.innerText = `撮影 (${n}) 枠${this.state.currentBoxes.length}`;
-            } else if (n >= 2) {
-                this.dom.btnAction.innerText = `学習開始 (${n}枚)`;
+
+            const c = AppEngine.DataManager.counts();
+            const nBox = this.state.currentBoxes.length;
+            const training = AppEngine.TrainingEngine.isTraining;
+            this.dom.countObj.textContent = c.obj;
+            this.dom.countBg.textContent = c.bg;
+            this.dom.btnClear.disabled = training || c.obj + c.bg === 0;
+
+            let hint;
+            if (training) {
+                hint = '学習中です。しばらくお待ちください';
+            } else if (frozen) {
+                this.dom.freezeChip.textContent = nBox > 0 ? `静止中 — 枠 ${nBox}個` : '静止中 — 対象を指で囲んでください';
+                hint = nBox > 0
+                    ? '他にも対象があれば続けて囲めます。終わったら「この写真を保存」'
+                    : '対象を指でなぞって四角く囲んでください';
+            } else if (c.obj === 0) {
+                hint = '対象を指でなぞって囲むと、映像が止まります';
+            } else if (!this.canTrain()) {
+                hint = '角度や距離を変えて、もう1枚以上撮ってください';
             } else {
-                this.dom.btnAction.innerText = `撮影 (${n})`;
+                hint = '撮り足すか、「学習開始」を押してください';
+            }
+            this.dom.trainHint.textContent = hint;
+
+            if (frozen) {
+                this.dom.btnSub.textContent = 'やり直す';
+                this.dom.btnMain.textContent = nBox > 0 ? `この写真を保存（枠${nBox}）` : 'この写真を保存';
+                this.dom.btnSub.disabled = false;
+                this.dom.btnMain.disabled = nBox === 0;
+            } else {
+                this.dom.btnSub.textContent = '背景を撮影';
+                const n = c.obj + c.bg;
+                this.dom.btnMain.textContent = training ? '学習中…' : (n > 0 ? `学習開始（${n}枚）` : '学習開始');
+                this.dom.btnSub.disabled = training;
+                this.dom.btnMain.disabled = training || !this.canTrain();
             }
         },
 
@@ -212,29 +300,54 @@
             if (this.dom.statusText) this.dom.statusText.innerText = text;
         },
 
+        /** 画面下部に短いお知らせを出す */
+        showToast(text) {
+            const t = this.dom.toast;
+            if (!t) return;
+            t.textContent = text;
+            t.classList.add('is-visible');
+            clearTimeout(this._toastTimer);
+            this._toastTimer = setTimeout(() => t.classList.remove('is-visible'), 2200);
+        },
+
+        flashCapture() {
+            const f = this.dom.flash;
+            f.classList.remove('is-active');
+            void f.offsetWidth; // アニメーションを最初から再生
+            f.classList.add('is-active');
+        },
+
+        // ---------- 学習モードの操作 ----------
+
+        handleSubAction() {
+            if (this.state.mode !== 'TRAIN') return;
+            if (this.isFrozen()) this.cancelFrame();
+            else this.captureBackground();
+        },
+
         handleMainAction() {
-            if (this.state.mode === 'TRAIN') {
-                if (this.state.currentBoxes.length > 0) {
-                    this.captureSample();
-                } else if (this.state.datasetCount >= 2) {
-                    this.startTraining();
-                }
-            } else if (this.state.mode === 'DETECT') {
-                this.sfx.playDetectionPing();
-            } else {
-                this.setMode('TRAIN');
-            }
+            if (this.state.mode !== 'TRAIN') return;
+            if (this.isFrozen()) this.captureSample();
+            else if (this.canTrain()) this.startTraining();
+        },
+
+        /** 止めた写真と描いた枠を捨てて、映像を再開する */
+        cancelFrame() {
+            this.state.pendingFrame = null;
+            this.state.currentBoxes = [];
+            this.state.drawingBox = null;
+            this.clearCanvas();
+            this.resumeVideo();
+            this.updateTrainUI();
         },
 
         clearDataset() {
+            const n = AppEngine.DataManager.size();
+            if (n === 0) return;
+            if (!window.confirm(`撮影した ${n}枚 をすべて消去します。よろしいですか？\n（学習済みの結果は消えません）`)) return;
             AppEngine.DataManager.clear();
-            this.state.datasetCount = 0;
-            this.state.currentBoxes = [];
-            this.state.pendingFrame = null;
-            this.clearCanvas();
-            this.resumeVideo();
-            this.sfx.playAnnotate();
-            this.updateActionLabel();
+            this.cancelFrame();
+            this.showToast('撮影データを消去しました');
         },
 
         pauseVideo() {
@@ -247,25 +360,12 @@
         },
 
         captureSample() {
-            if (this.state.currentBoxes.length === 0) return;
-            let frame = this.state.pendingFrame;
-            if (!frame) {
-                frame = document.createElement('canvas');
-                frame.width = frame.height = AppEngine.INPUT_SIZE;
-                if (!this.grabFrame(frame)) return;
-            }
-
+            if (this.state.currentBoxes.length === 0 || !this.state.pendingFrame) return;
             this.sfx.playAnnotate();
-            AppEngine.DataManager.addSample(frame, "Target", this.state.currentBoxes);
-            this.state.datasetCount = AppEngine.DataManager.size();
-
-            // 次の1枚へ
-            this.state.pendingFrame = null;
-            this.state.currentBoxes = [];
-            this.clearCanvas();
-            this.resumeVideo();
-            this.showCounts();
-            this.updateActionLabel();
+            AppEngine.DataManager.addSample(this.state.pendingFrame, "Target", this.state.currentBoxes);
+            this.flashCapture();
+            this.showToast(`保存しました（対象 ${AppEngine.DataManager.counts().obj}枚目）`);
+            this.cancelFrame(); // 次の1枚へ
         },
 
         /**
@@ -273,24 +373,20 @@
          */
         captureBackground() {
             if (this.state.mode !== 'TRAIN' || AppEngine.TrainingEngine.isTraining) return;
-            this.resumeVideo();
             const frame = document.createElement('canvas');
             frame.width = frame.height = AppEngine.INPUT_SIZE;
             if (!this.grabFrame(frame)) return;
             this.sfx.playAnnotate();
             AppEngine.DataManager.addSample(frame, "Background", []);
-            this.state.datasetCount = AppEngine.DataManager.size();
-            this.state.pendingFrame = null;
-            this.state.currentBoxes = [];
-            this.clearCanvas();
-            this.showCounts();
-            this.updateActionLabel();
+            this.flashCapture();
+            this.showToast(`背景を保存しました（${AppEngine.DataManager.counts().bg}枚目）`);
+            this.updateTrainUI();
         },
 
         /** 学習結果をファイルに書き出す (URLが変わっても読み込めば復元できる) */
         exportModel() {
             if (!AppEngine.InferenceEngine.isTrained()) {
-                this.updateStatus('WARN', '保存する学習結果がありません');
+                this.showToast('保存する学習結果がありません');
                 return;
             }
             const json = JSON.stringify(AppEngine.Head.toJSON());
@@ -305,7 +401,7 @@
             a.click();
             a.remove();
             setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-            this.updateStatus('OK', '学習結果を保存しました');
+            this.showToast('学習結果をファイルに保存しました');
         },
 
         /** 書き出したファイルから学習結果を読み込む */
@@ -317,7 +413,8 @@
                 AppEngine.Head.fromJSON(obj);
                 AppEngine.Head.save(); // このURLでも次回から自動で使う
                 this.sfx.playLearnSuccess();
-                this.updateStatus('OK', '学習結果を読み込みました');
+                this.showToast('学習結果を読み込みました');
+                if (this.state.mode === 'DETECT') this.updateStatus('OK', '検出中');
             } catch (e) {
                 console.error('[Orchestrator] import failed', e);
                 this.updateStatus('CRIT', `読込エラー：${e.message}`);
@@ -326,43 +423,34 @@
             }
         },
 
-        showCounts() {
-            const c = AppEngine.DataManager.counts();
-            this.updateStatus('WARN', `対象 ${c.obj}枚 / 背景 ${c.bg}枚`);
-        },
-
         async startTraining() {
             this.dom.trainPanel.style.display = 'grid';
-            this.dom.annoTools.style.display = 'none'; // 学習パネルと重ならないよう隠す
+            this.dom.progressBar.style.width = '0%';
             this.sfx.playLearnStart();
             this.updateStatus('WARN', '学習中…');
-            this.dom.btnAction.disabled = true;
             this.dom.btnDetect.disabled = true;
             this.dom.btnTrain.disabled = true;
 
             const dataset = AppEngine.DataManager.getDataset();
-            const result = await AppEngine.TrainingEngine.runTrainingLoop(dataset, (data) => {
+            const run = AppEngine.TrainingEngine.runTrainingLoop(dataset, (data) => {
                 this.updateTrainingUI(data);
             });
+            this.updateTrainUI(); // isTraining=true になった状態でボタンを無効化
+            const result = await run;
 
-            this.dom.btnAction.disabled = false;
             this.dom.btnDetect.disabled = false;
             this.dom.btnTrain.disabled = false;
-            this.dom.annoTools.style.display = 'flex';
             this.visual.resetOverfitVisual();
+            this.dom.trainPanel.style.display = 'none';
 
             if (result.success) {
-                this.updateStatus('OK', '学習完了');
                 this.sfx.playLearnSuccess();
-                this.dom.btnAction.innerText = '検出する';
-                this.dom.btnAction.onclick = () => {
-                    this.dom.btnAction.onclick = () => this.handleMainAction();
-                    this.setMode('DETECT');
-                };
+                this.setMode('DETECT');
+                this.showToast('学習が完了しました。検出モードに切り替えました');
             } else {
                 this.updateStatus('CRIT', `学習エラー：${result.error || ''}`);
                 this.dom.statusText.title = result.error || '';
-                this.updateActionLabel();
+                this.updateTrainUI();
             }
         },
 
@@ -381,6 +469,8 @@
 
             this.visual.drawLossGraph(data.trainHistory, data.valHistory, this.dom.lossChart);
         },
+
+        // ---------- 検出モード ----------
 
         async runInferenceLoop() {
             if (this.state.mode !== 'DETECT') return;
@@ -406,14 +496,20 @@
             requestAnimationFrame(() => this.runInferenceLoop());
         },
 
+        // ---------- 枠を描く操作 ----------
+
         startAnno(e) {
+            // メニューが開いているときのタップは「メニューを閉じる」だけにする
+            if (!this.dom.menu.hidden) { this.toggleMenu(false); return; }
             if (this.state.mode !== 'TRAIN' || AppEngine.TrainingEngine.isTraining) return;
             // 描き始めた瞬間のフレームを保存し、映像を止める
             if (!this.state.pendingFrame) {
                 const f = document.createElement('canvas');
                 f.width = f.height = AppEngine.INPUT_SIZE;
-                if (this.grabFrame(f)) this.state.pendingFrame = f;
+                if (!this.grabFrame(f)) return;
+                this.state.pendingFrame = f;
                 this.pauseVideo();
+                this.updateTrainUI();
             }
             const rect = this.dom.canvas.getBoundingClientRect();
             this.state.startPos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -447,14 +543,14 @@
             this.state.isDrawing = false;
             const b = this.state.drawingBox;
             this.state.drawingBox = null;
-            if (!b || b.w < 0.03 || b.h < 0.03) {
+            if (b && b.w >= 0.03 && b.h >= 0.03) {
+                this.state.currentBoxes.push(b);
+            } else if (this.state.currentBoxes.length > 0) {
                 // 短くタップ = 描いた枠を全部消す
                 this.state.currentBoxes = [];
-            } else {
-                this.state.currentBoxes.push(b);
             }
             this.renderCurrentBBox();
-            this.updateActionLabel();
+            this.updateTrainUI();
         },
 
         renderCurrentBBox() {

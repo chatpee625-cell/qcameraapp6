@@ -15,6 +15,7 @@
     class SfxEngine {
         constructor() {
             this.ctx = null;
+            this.enabled = false; // 効果音のオン/オフ (メニューで切替。初期はオフ)
         }
 
         _init() {
@@ -30,6 +31,7 @@
         }
 
         _playTone(freq, type, duration, volume, slideFreq = null) {
+            if (!this.enabled) return;
             try {
                 this._init();
                 if (!this.ctx) return;
@@ -63,7 +65,6 @@
             this._playTone(150, 'sawtooth', 0.3, 0.25);
             this._playTone(140, 'sawtooth', 0.3, 0.25);
         }
-        playDetectionPing() { this._playTone(1200, 'sine', 0.05, 0.1); }
     }
 
     class VisualEngine {
