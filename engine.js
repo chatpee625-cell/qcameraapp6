@@ -404,7 +404,8 @@
             this.confidenceThreshold = 0.6;
             this.maxBoxes = 5;
             this.targetLabel = 'Target';
-            this.tracks = []; // { box, conf, hits, miss }
+            this.tracks = []; // { id, box, conf, hits, miss }
+            this.nextId = 1;  // 枠ごとの番号 (測定値をなめらかにするため、同じ物には同じ番号)
             this.lastTime = 0;
 
             // 表示の落ち着かせ方 (検出の判定そのものには影響しない)
@@ -438,7 +439,7 @@
             this._updateTracks(this._findBlobs(prob), dt);
             return this.tracks
                 .filter(t => t.hits >= this.confirmHits)
-                .map(t => ({ box: { ...t.box }, label: this.targetLabel, conf: t.conf }));
+                .map(t => ({ id: t.id, box: { ...t.box }, label: this.targetLabel, conf: t.conf }));
         }
 
         /** 前フレームの枠と重なるものは同じ物として滑らかに動かす */
@@ -473,7 +474,7 @@
                 t.hits >= this.confirmHits ? t.miss <= this.holdMisses : t.miss === 0);
             blobs.forEach((b, i) => {
                 if (!used.has(i) && this.tracks.length < this.maxBoxes) {
-                    this.tracks.push({ box: { x: b.x, y: b.y, w: b.w, h: b.h }, conf: b.conf, hits: 1, miss: 0 });
+                    this.tracks.push({ id: this.nextId++, box: { x: b.x, y: b.y, w: b.w, h: b.h }, conf: b.conf, hits: 1, miss: 0 });
                 }
             });
         }

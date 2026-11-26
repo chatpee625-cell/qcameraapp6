@@ -8,6 +8,9 @@
         PRIMARY: '#4c9be8',   // 検出枠・学習Loss
         WARNING: '#d9a23a',   // 検証Loss・過学習の兆候
         SUCCESS: '#3fbf7f',
+        OK: '#3fbf7f',        // 測定: 許容値未満
+        NG: '#e5534b',        // 測定: 許容値以上
+        MUTED: '#969ca5',     // 測定できなかった枠
         NEUTRAL: '#e4e6e9',
         LABEL_BG: 'rgba(14, 16, 19, 0.85)'
     };
@@ -82,21 +85,23 @@
         /**
          * 検出枠: 細い実線 + 控えめなラベル
          * @param box キャンバスの画素単位の {x, y, w, h}
+         * @param opts { color, text, labelBg, labelFg } 測定モードで色と文字を変えるとき
          */
-        drawBBox(box, label, confidence) {
+        drawBBox(box, label, confidence, opts = {}) {
             if (!this.ctx) return;
             const ctx = this.ctx;
             const s = this._scale();
             const { x, y, w, h } = box;
+            const color = opts.color || COLORS.PRIMARY;
 
             ctx.save();
-            ctx.strokeStyle = COLORS.PRIMARY;
+            ctx.strokeStyle = color;
             ctx.lineWidth = 2 * s;
             ctx.lineJoin = 'miter';
             ctx.strokeRect(x, y, w, h);
 
             // ラベル (枠の左上、画面外に出る場合は枠の内側)
-            const text = `${label}  ${Math.round(confidence * 100)}%`;
+            const text = opts.text || `${label}  ${Math.round(confidence * 100)}%`;
             const fontPx = 12 * s;
             ctx.font = `500 ${fontPx}px ui-monospace, Menlo, Consolas, monospace`;
             const padX = 6 * s;
@@ -104,11 +109,56 @@
             const textW = ctx.measureText(text).width;
             const ly = y - boxH >= 0 ? y - boxH : y;
 
-            ctx.fillStyle = COLORS.LABEL_BG;
+            ctx.fillStyle = opts.labelBg || COLORS.LABEL_BG;
             ctx.fillRect(x - ctx.lineWidth / 2, ly, textW + padX * 2, boxH);
-            ctx.fillStyle = COLORS.NEUTRAL;
+            ctx.fillStyle = opts.labelFg || COLORS.NEUTRAL;
             ctx.textBaseline = 'middle';
             ctx.fillText(text, x - ctx.lineWidth / 2 + padX, ly + boxH / 2);
+            ctx.restore();
+        }
+
+        /** 測った範囲 (向きに合わせた長方形) を細い線で描く。points はキャンバスの画素単位 */
+        drawPolygon(points, color) {
+            if (!this.ctx || !points || points.length < 3) return;
+            const ctx = this.ctx, s = this._scale();
+            ctx.save();
+            ctx.strokeStyle = color || COLORS.NEUTRAL;
+            ctx.globalAlpha = 0.85;
+            ctx.lineWidth = 1 * s;
+            ctx.setLineDash([4 * s, 3 * s]);
+            ctx.beginPath();
+            points.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+            ctx.closePath();
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        /** 十円玉の印 (円 + 「10円」のラベル)。キャンバスの画素単位 */
+        drawCoinMarker(cx, cy, r) {
+            if (!this.ctx) return;
+            const ctx = this.ctx, s = this._scale();
+            ctx.save();
+            ctx.strokeStyle = COLORS.NEUTRAL;
+            ctx.lineWidth = 1.5 * s;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.stroke();
+            // 中心の十字
+            const t = 5 * s;
+            ctx.beginPath();
+            ctx.moveTo(cx - t, cy); ctx.lineTo(cx + t, cy);
+            ctx.moveTo(cx, cy - t); ctx.lineTo(cx, cy + t);
+            ctx.stroke();
+
+            const text = '10円 基準';
+            ctx.font = `500 ${11 * s}px ui-monospace, Menlo, Consolas, monospace`;
+            const tw = ctx.measureText(text).width, bh = 18 * s, pad = 5 * s;
+            const lx = cx - tw / 2 - pad, ly = Math.max(0, cy - r - bh - 4 * s);
+            ctx.fillStyle = COLORS.LABEL_BG;
+            ctx.fillRect(lx, ly, tw + pad * 2, bh);
+            ctx.fillStyle = COLORS.NEUTRAL;
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, lx + pad, ly + bh / 2);
             ctx.restore();
         }
 

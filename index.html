@@ -44,6 +44,14 @@
                         <input id="file-load" type="file" accept=".json,application/json" hidden>
                     </div>
 
+                    <!-- Measure info (検出モードで測定オンのとき) -->
+                    <div id="measure-info" class="train-info" hidden>
+                        <div class="train-info-main">
+                            <div id="measure-coin" class="train-hint">十円玉を画面に入れてください</div>
+                            <div id="measure-summary" class="train-counts"></div>
+                        </div>
+                    </div>
+
                     <!-- Training info (学習モードのみ) -->
                     <div id="train-info" class="train-info" hidden>
                         <div class="train-info-main">
@@ -94,6 +102,16 @@
                             <button id="btn-mode-detect" class="btn btn-secondary">検出</button>
                             <button id="btn-mode-train" class="btn btn-secondary">学習</button>
                         </div>
+                        <div id="detect-actions" class="action-row" hidden>
+                            <button id="btn-measure" class="btn btn-secondary measure-toggle" aria-pressed="false">
+                                測定<span class="toggle-state">オフ</span>
+                            </button>
+                            <label class="tol-field" for="input-tol">
+                                <span class="tol-label">許容値</span>
+                                <input id="input-tol" type="number" inputmode="decimal" step="0.1" min="0.1" value="5.0">
+                                <span class="tol-unit">mm</span>
+                            </label>
+                        </div>
                         <div id="train-actions" class="action-row" hidden>
                             <button id="btn-train-sub" class="btn btn-secondary">背景を撮影</button>
                             <button id="btn-train-main" class="btn btn-primary">学習開始</button>
@@ -110,6 +128,7 @@
     <script src="./utils.js"></script>
     <script src="./ux-helper.js"></script>
     <script src="./engine.js"></script>
+    <script src="./measure.js"></script>
     <script src="./main.js"></script>
 </body>
 </html>
