@@ -10,6 +10,8 @@
     const SOUND_KEY = 'app_sound_enabled';
     const MEASURE_ON_KEY = 'app_measure_on';
     const MEASURE_TOL_KEY = 'app_measure_tol';
+    const MEASURE_SHADOW_KEY = 'app_measure_shadow';
+    const MEASURE_INTERVAL_MS = 150; // 寸法を測る間隔 (毎フレーム測ると重いため)
     const median = (arr) => {
         const s = [...arr].sort((a, b) => a - b), m = s.length >> 1;
         return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
@@ -31,8 +33,10 @@
             tol: 5.0,          // 許容値 (mm)。これ以上なら NG
             coinD: [],         // 十円玉の直径 (解析画像の画素) の直近の値
             coin: null,        // 最後に見つけた十円玉
-            coinMiss: 99,      // 十円玉を見失っているフレーム数
-            hist: new Map()    // 枠の番号 → 直近の測定値 (mm) のリスト
+            coinMiss: 99,      // 十円玉を見失っている回数
+            hist: new Map(),   // 枠の番号 → { vals: 直近の測定値(mm), corners, circle, truncated }
+            lastAt: 0,         // 最後に測った時刻
+            cost: 0            // 直前の測定にかかった時間 (ms)
         },
 
         dom: {},
@@ -124,7 +128,8 @@
                 inputTol: $('input-tol'),
                 measureInfo: $('measure-info'),
                 measureCoin: $('measure-coin'),
-                measureSummary: $('measure-summary')
+                measureSummary: $('measure-summary'),
+                btnMenuShadow: $('btn-menu-shadow')
             };
         },
 
@@ -145,11 +150,12 @@
                     this.updateStatus('CRIT', 'カメラ非対応');
                     return;
                 }
+                // 寸法を細かく測るため高めの解像度を希望する (端末が出せない場合は近い解像度になる)
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: 'environment',
-                        width: { ideal: 640 },
-                        height: { ideal: 640 }
+                        width: { ideal: 1280 },
+                        height: { ideal: 960 }
                     },
                     audio: false
                 });
@@ -195,6 +201,7 @@
             this.dom.btnMenuSave.onclick = () => { this.toggleMenu(false); this.exportModel(); };
             this.dom.btnMenuLoad.onclick = () => { this.toggleMenu(false); this.dom.fileLoad.click(); };
             this.dom.btnMenuSound.onclick = () => this.setSound(!this.sfx.enabled);
+            this.dom.btnMenuShadow.onclick = () => this.setShadow(!this.measure.shadow);
             this.dom.fileLoad.onchange = (e) => this.importModel(e.target.files[0]);
 
             // 測定モード
@@ -241,14 +248,28 @@
         },
 
         loadMeasureSetting() {
-            let on = false, tol = 5.0;
+            let on = false, tol = 5.0, shadow = true;
             try {
                 on = localStorage.getItem(MEASURE_ON_KEY) === '1';
                 const t = parseFloat(localStorage.getItem(MEASURE_TOL_KEY));
                 if (t > 0) tol = t;
+                shadow = localStorage.getItem(MEASURE_SHADOW_KEY) !== '0';
             } catch (e) { /* noop */ }
             this.setTolerance(tol, false);
             this.setMeasure(on, false);
+            this.setShadow(shadow, false);
+        },
+
+        /** 測定で影を除くか (影は背景と同じ色味のまま暗いだけ、として除く) */
+        setShadow(on, save = true) {
+            this.measure.shadow = on;
+            if (window.AppMeasure) AppMeasure.setOptions({ shadow: on });
+            this.dom.btnMenuShadow.setAttribute('aria-pressed', String(on));
+            this.dom.btnMenuShadow.querySelector('.toggle-state').textContent = on ? 'オン' : 'オフ';
+            this.resetMeasureState();
+            if (save) {
+                try { localStorage.setItem(MEASURE_SHADOW_KEY, on ? '1' : '0'); } catch (e) { /* noop */ }
+            }
         },
 
         setMeasure(on, save = true) {
@@ -278,7 +299,7 @@
 
         resetMeasureState() {
             const m = this.measure;
-            m.coinD = []; m.coin = null; m.coinMiss = 99; m.hist = new Map();
+            m.coinD = []; m.coin = null; m.coinMiss = 99; m.hist = new Map(); m.lastAt = 0;
         },
 
         // ---------- 画面の状態 ----------
@@ -554,11 +575,20 @@
             if (this.state.mode !== 'DETECT') return;
 
             const measuring = this.measure.enabled && window.AppMeasure;
+            // 寸法は数フレームおきに測る (その間は直前の測定値で表示する)
+            let doMeasure = false;
             let results = [];
             try {
                 if (this.grabFrame(this.inferCanvas)) {
                     // 測定用の画像は推論と同じ瞬間のフレームから取る
-                    if (measuring) AppMeasure.capture(this.dom.video, this.getCrop());
+                    const now = performance.now();
+                    // 測定が重い端末では、かかった時間の2倍あけて、検出の表示が止まらないようにする
+                    const interval = Math.max(MEASURE_INTERVAL_MS, this.measure.cost * 2);
+                    if (measuring && now - this.measure.lastAt >= interval) {
+                        AppMeasure.capture(this.dom.video, this.getCrop());
+                        this.measure.lastAt = now;
+                        doMeasure = true;
+                    }
                     results = await AppEngine.InferenceEngine.predict(this.inferCanvas);
                 }
             } catch (e) {
@@ -568,7 +598,7 @@
 
             this.clearCanvas();
             if (measuring) {
-                this.drawMeasured(results);
+                this.drawMeasured(results, doMeasure);
             } else {
                 const layout = { canvasW: this.dom.canvas.width, canvasH: this.dom.canvas.height };
                 results.forEach(res => {
@@ -582,26 +612,34 @@
 
         /**
          * 測定モードの描画: 十円玉を基準に各枠の長さ (mm) を出し、許容値で色分けする
+         * @param doMeasure true のときだけ新しく測る (それ以外は直前の測定値で表示)
          */
-        drawMeasured(results) {
+        drawMeasured(results, doMeasure) {
             const m = this.measure, C = DetectionUXHelper.Colors;
             const cw = this.dom.canvas.width, ch = this.dom.canvas.height;
-            let analysis;
-            try {
-                analysis = AppMeasure.analyze(results.map(r => r.box));
-            } catch (e) {
-                console.error('[Orchestrator] measure error', e);
-                analysis = { coin: null, items: [] };
-            }
-
-            // 十円玉: 数フレーム見失っても直前の値を使い、直径は直近5回の中央値
-            if (analysis.coin) {
-                m.coin = analysis.coin;
-                m.coinD.push(analysis.coin.diameterPx);
-                if (m.coinD.length > 5) m.coinD.shift();
-                m.coinMiss = 0;
-            } else if (++m.coinMiss > 5) {
-                m.coin = null; m.coinD = [];
+            let analysis = null;
+            if (doMeasure) {
+                const t0 = performance.now();
+                try {
+                    analysis = AppMeasure.analyze(results.map(r => r.box));
+                    m.cost = performance.now() - t0;
+                } catch (e) {
+                    console.error('[Orchestrator] measure error', e);
+                    analysis = { coin: null, items: [] };
+                }
+                // 十円玉: 数回見失っても直前の値を使い、直径は直近5回の中央値。
+                // 直近の値と15%以上違う値は、模様の輪などを拾った誤りとして使わない
+                // (本当に距離が変わったときは、見失い扱いが続いたあと測り直しになる)
+                const c = analysis.coin;
+                const med0 = m.coinD.length >= 3 ? median(m.coinD) : 0;
+                if (c && (!med0 || Math.abs(c.diameterPx - med0) / med0 <= 0.15)) {
+                    m.coin = c;
+                    m.coinD.push(c.diameterPx);
+                    if (m.coinD.length > 5) m.coinD.shift();
+                    m.coinMiss = 0;
+                } else if (++m.coinMiss > 4) {
+                    m.coin = null; m.coinD = [];
+                }
             }
             const mmPerPx = m.coin ? AppMeasure.COIN_MM / median(m.coinD) : null;
 
@@ -611,32 +649,46 @@
             const hist = new Map();
             let ng = 0, ok = 0;
             results.forEach((res, i) => {
-                const item = analysis.items[i];
                 const screenBox = AppUtils.CoordinateTransformer.denormalize(res.box, layout);
-                const h = (m.hist.get(res.id) || []).slice();
-                if (mmPerPx && item) {
-                    h.push(item.lengthPx * mmPerPx);
-                    if (h.length > 5) h.shift();
+                const prev = m.hist.get(res.id);
+                const rec = prev ? { ...prev, vals: prev.vals.slice() } : { vals: [], corners: null, circle: null, truncated: false };
+                if (analysis) {
+                    const item = analysis.items[i];
+                    if (mmPerPx && item) {
+                        rec.vals.push(item.lengthPx * mmPerPx);
+                        if (rec.vals.length > 5) rec.vals.shift();
+                        rec.corners = item.corners; rec.circle = item.circle; rec.truncated = item.truncated;
+                    }
                 }
-                hist.set(res.id, h);
+                hist.set(res.id, rec);
 
                 if (!mmPerPx) {
                     // 十円玉がない: 普段の枠のまま
                     this.visual.drawBBox(screenBox, res.label, res.conf);
                     return;
                 }
-                if (!h.length) {
+                if (!rec.vals.length) {
                     this.visual.drawBBox(screenBox, res.label, res.conf, {
                         color: C.MUTED, text: '測定不可', labelBg: C.MUTED, labelFg: '#0e1013'
                     });
                     return;
                 }
-                const mm = median(h);
+                const mm = median(rec.vals);
                 const isNg = mm >= m.tol;
                 if (isNg) ng++; else ok++;
                 const color = isNg ? C.NG : C.OK;
-                if (item) this.visual.drawPolygon(item.corners.map(p => ({ x: p.x * cw, y: p.y * ch })), color);
-                const prefix = item && item.truncated ? '≥' : '';
+                // 測った範囲 (丸い物は円、それ以外は傾きに合わせた長方形)
+                if (rec.circle) {
+                    const c = rec.circle, pts = [];
+                    for (let k = 0; k < 48; k++) {
+                        const t = (2 * Math.PI * k) / 48;
+                        pts.push({ x: (c.x + c.r * Math.cos(t)) * cw, y: c.y * ch + c.r * cw * Math.sin(t) });
+                    }
+                    this.visual.drawPolygon(pts, color);
+                } else if (rec.corners) {
+                    this.visual.drawPolygon(rec.corners.map(p => ({ x: p.x * cw, y: p.y * ch })), color);
+                }
+                const prefix = rec.truncated ? '≥' : (rec.circle ? '⌀' : '');
                 this.visual.drawBBox(screenBox, res.label, res.conf, {
                     color,
                     text: `${prefix}${mm.toFixed(1)}mm  ${isNg ? 'NG' : 'OK'}`,
@@ -648,7 +700,7 @@
 
             // 上部の案内
             if (mmPerPx) {
-                this.dom.measureCoin.textContent = `十円玉を検出中（1画素 ≈ ${mmPerPx.toFixed(2)}mm）`;
+                this.dom.measureCoin.textContent = `十円玉を検出中（1画素 ≈ ${mmPerPx.toFixed(3)}mm）`;
                 this.dom.measureSummary.innerHTML = results.length
                     ? `<span class="measure-summary-ng">NG <b>${ng}</b></span><span class="measure-summary-ok">OK <b>${ok}</b></span><span>許容値 ${m.tol.toFixed(1)}mm 以上でNG</span>`
                     : '<span>対象が見つかりません</span>';
