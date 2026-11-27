@@ -148,8 +148,13 @@
     const head = new DetectionHead();
 
     /**
-     * BBox → 14x14マスの正解ラベル
-     * y: 1=対象, 0=背景 / m: 1=学習に使う, 0=境界なので無視
+     * BBox → 14x14マスの正解ラベル (0〜1 の中間値もあり)
+     *
+     * マスと枠の重なり具合で正解を決める。重なりは「マスの大きさ」と「枠の太さ」の
+     * 小さい方を基準に測るので、マスより細い物がマスの境目にまたがっていても、
+     * 両側のマスが「対象」として学習される。
+     *   重なり 50%以上 → 1 (対象) / 15%以下 → 0 (背景) / その間 → なめらかに変化
+     * y: 正解 / m: 学習に使うか (現在はすべて使う)
      */
     function makeLabels(boxes, flip) {
         const y = new Float32Array(GRID * GRID);
@@ -157,28 +162,26 @@
         // 背景だけのサンプル: 全マス「対象ではない」
         if (!boxes || boxes.length === 0) return { y, m };
 
-        const half = 0.5 / GRID;
+        const cell = 1 / GRID;
         const bs = boxes.map(bb => flip ? { x: 1 - bb.x - bb.w, y: bb.y, w: bb.w, h: bb.h } : bb);
         for (let r = 0; r < GRID; r++) {
             for (let c = 0; c < GRID; c++) {
-                const cx = (c + 0.5) / GRID;
-                const cy = (r + 0.5) / GRID;
-                const i = r * GRID + c;
-                let inside = false, nearEdge = false;
+                const x0 = c * cell, y0 = r * cell;
+                let cov = 0;
                 for (const b of bs) {
-                    if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h) inside = true;
-                    else if (cx >= b.x - half && cx <= b.x + b.w + half &&
-                             cy >= b.y - half && cy <= b.y + b.h + half) nearEdge = true;
+                    const ox = Math.max(0, Math.min(x0 + cell, b.x + b.w) - Math.max(x0, b.x));
+                    const oy = Math.max(0, Math.min(y0 + cell, b.y + b.h) - Math.max(y0, b.y));
+                    const cv = (ox / Math.min(cell, b.w)) * (oy / Math.min(cell, b.h));
+                    cov = Math.max(cov, cv);
                 }
-                if (inside) { y[i] = 1; m[i] = 1; }
-                else if (nearEdge) { m[i] = 0; } // 境界は学習に使わない
+                y[r * GRID + c] = Math.max(0, Math.min(1, (cov - 0.15) / 0.35));
             }
         }
         // 小さすぎる枠でも中心マスは必ず正解にする
         for (const b of bs) {
             const c = Math.min(GRID - 1, Math.max(0, Math.floor((b.x + b.w / 2) * GRID)));
             const r = Math.min(GRID - 1, Math.max(0, Math.floor((b.y + b.h / 2) * GRID)));
-            y[r * GRID + c] = 1; m[r * GRID + c] = 1;
+            y[r * GRID + c] = 1;
         }
         return { y, m };
     }
@@ -401,7 +404,8 @@
     class InferenceEngine {
         constructor() {
             this.isActive = false;
-            this.confidenceThreshold = 0.6;
+            this.confidenceThreshold = 0.6; // 塊の起点になるマスの確率
+            this.growThreshold = 0.35;      // 起点につながっていれば、この確率以上のマスも塊に含める
             this.maxBoxes = 5;
             this.targetLabel = 'Target';
             this.tracks = []; // { id, box, conf, hits, miss }
@@ -412,7 +416,6 @@
             this.smoothTime = 0.25;  // 秒。枠が新しい位置に追いつく速さ (大きいほどゆっくり)
             this.confirmHits = 2;    // 何フレーム続けて見えたら表示するか (一瞬の誤検出を出さない)
             this.holdMisses = 4;     // 何フレーム見失うまで表示を続けるか (点滅を防ぐ)
-            this.edgeLow = 0.3;      // 枠の端を半マス単位で調整するときの下限確率
             this.deadZone = 0.02;    // 画面の2%未満のずれは無視して枠を止めておく (小刻みな震えを防ぐ)
         }
 
@@ -485,19 +488,50 @@
          * しきい値をまたいでマスが増減しても、枠の端が1マス分いきなり飛ばないようにする。
          */
         _edgeOffset(pIn, pOut) {
-            const th = this.confidenceThreshold, lo = this.edgeLow;
+            const th = this.growThreshold, lo = th / 2;
             const clamp01 = (v) => Math.max(0, Math.min(1, v));
             const shrink = 0.5 * (1 - clamp01((pIn - th) / (1 - th)));
             const grow = 0.5 * clamp01((pOut - lo) / (th - lo));
             return grow - shrink;
         }
 
-        /** しきい値以上のマスの塊をすべて枠にする (ノイズ的な1マスは除外) */
+        /**
+         * 確率の高いマスの塊をすべて枠にする (ノイズ的な1マスは除外)
+         * - 起点: confidenceThreshold 以上のマス
+         * - 広げる: growThreshold 以上で、上下左右の2方向以上が塊に接しているマス
+         *           (細長い物の真ん中が少し弱くても途切れない)
+         * - つながり: 起点の強さのマス同士は斜めもつなぐ (傾いた細長い物が階段状でも1つになる)
+         */
         _findBlobs(prob) {
-            const th = this.confidenceThreshold;
+            const th = this.confidenceThreshold, tg = this.growThreshold;
             const seen = new Uint8Array(GRID * GRID);
             const blobs = [];
             const P = (r, c) => (r < 0 || c < 0 || r >= GRID || c >= GRID) ? 0 : prob[r * GRID + c];
+
+            // 塊に含めるマス: 強いマス + 「上下左右のうち2方向以上が塊に接している」弱いマス
+            // (細長い物の真ん中の弱いマスは両側に接するので含まれ、途切れない。
+            //  弱いマスが2つ並んだ切れ目も、両端が塊ならつなぐ。
+            //  枠の外側のノイズは1方向しか接しないので含まれず、枠がふらつかない)
+            const inSet = new Uint8Array(GRID * GRID);
+            for (let i = 0; i < GRID * GRID; i++) if (prob[i] >= th) inSet[i] = 1;
+            for (let iter = 0; iter < 3; iter++) {
+                const add = [];
+                for (let i = 0; i < GRID * GRID; i++) {
+                    if (inSet[i] || prob[i] < tg) continue;
+                    const r = Math.floor(i / GRID), c = i % GRID;
+                    const IN = (rr, cc) => rr >= 0 && cc >= 0 && rr < GRID && cc < GRID && inSet[rr * GRID + cc] === 1;
+                    const WK = (rr, cc) => rr >= 0 && cc >= 0 && rr < GRID && cc < GRID && prob[rr * GRID + cc] >= tg;
+                    const n = IN(r - 1, c) + IN(r + 1, c) + IN(r, c - 1) + IN(r, c + 1);
+                    // 弱いマスが2つ並んだ切れ目も、両端が塊ならつなぐ
+                    const bridge =
+                        (IN(r, c - 1) && WK(r, c + 1) && IN(r, c + 2)) || (IN(r, c + 1) && WK(r, c - 1) && IN(r, c - 2)) ||
+                        (IN(r - 1, c) && WK(r + 1, c) && IN(r + 2, c)) || (IN(r + 1, c) && WK(r - 1, c) && IN(r - 2, c));
+                    if (n >= 2 || bridge) add.push(i);
+                }
+                if (!add.length) break;
+                add.forEach(i => { inSet[i] = 1; });
+            }
+
             for (let i = 0; i < GRID * GRID; i++) {
                 if (seen[i] || prob[i] < th) continue;
                 const stack = [i];
@@ -511,11 +545,19 @@
                     minR = Math.min(minR, r); maxR = Math.max(maxR, r);
                     minC = Math.min(minC, c); maxC = Math.max(maxC, c);
                     score += prob[k]; maxP = Math.max(maxP, prob[k]);
-                    [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]].forEach(([rr, cc]) => {
-                        if (rr < 0 || cc < 0 || rr >= GRID || cc >= GRID) return;
-                        const n = rr * GRID + cc;
-                        if (!seen[n] && prob[n] >= th) { seen[n] = 1; stack.push(n); }
-                    });
+                    for (let dr = -1; dr <= 1; dr++) {
+                        for (let dc = -1; dc <= 1; dc++) {
+                            if (!dr && !dc) continue;
+                            const rr = r + dr, cc = c + dc;
+                            if (rr < 0 || cc < 0 || rr >= GRID || cc >= GRID) continue;
+                            const n = rr * GRID + cc;
+                            if (seen[n] || !inSet[n]) continue;
+                            // 強いマス同士は斜めでもつなぐ。弱いマスは上下左右だけでつなぐ
+                            const diag = dr !== 0 && dc !== 0;
+                            const ok = diag ? (prob[k] >= th && prob[n] >= th) : true;
+                            if (ok) { seen[n] = 1; stack.push(n); }
+                        }
+                    }
                 }
                 if (members.length < 2 && maxP < 0.85) continue;
 
